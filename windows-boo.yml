@@ -1,0 +1,223 @@
+name: Windows Cloud RDP (MiUnlock)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How many minutes to keep the machine alive (max 350)"
+        required: false
+        default: "120"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: 1. Enable Remote Desktop and Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+
+      - name: 2. Create admin account
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ($Env:RDP_PASSWORD) {
+            $plain = $Env:RDP_PASSWORD
+          } else {
+            $plain = "Nexouya2026RdpX7"
+            Write-Host "WARNING: secret RDP_PASSWORD is not set, using the old default password. Add the secret to be safe." -ForegroundColor Yellow
+          }
+          $Password = ConvertTo-SecureString $plain -AsPlainText -Force
+          New-LocalUser -Name "NexAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "NexAdmin" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "NexAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin $plain
+
+      - name: 3. Speed tuning (power, clock, background services, Defender)
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          # High performance power plan, never sleep
+          powercfg -setactive SCHEME_MIN
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+
+          # Defender: real-time scanning off, tool folder excluded
+          try {
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+            Add-MpPreference -ExclusionPath "C:\MiUnlock" -ErrorAction Stop
+            Write-Host "Defender real-time scanning is off"
+          } catch {
+            Write-Host "Could not change Defender settings: $($_.Exception.Message)"
+          }
+
+          # Stop background services that use CPU or network
+          foreach ($svc in 'wuauserv','UsoSvc','DoSvc','BITS','SysMain','DiagTrack') {
+            try {
+              Stop-Service -Name $svc -Force -ErrorAction Stop
+              Set-Service -Name $svc -StartupType Disabled
+            } catch { }
+          }
+
+          # Do not pop up Server Manager at logon
+          try {
+            New-Item -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Force | Out-Null
+            New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name DoNotOpenServerManagerAtLogon -Value 1 -PropertyType DWord -Force | Out-Null
+          } catch { }
+
+          # System clock sync (the tool also does its own NTP sync)
+          try {
+            Set-Service -Name w32time -StartupType Automatic
+            Start-Service -Name w32time -ErrorAction SilentlyContinue
+            w32tm /config /manualpeerlist:"time.cloudflare.com,0x9 time.google.com,0x9" /syncfromflags:manual /reliable:yes /update | Out-Null
+            w32tm /resync /force | Out-Null
+            w32tm /query /status
+          } catch {
+            Write-Host "Clock sync step failed: $($_.Exception.Message)"
+          }
+
+      - name: 4. Install Firefox and make it the default browser
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          Invoke-WebRequest "https://download.mozilla.org/?product=firefox-msi-latest-ssl&os=win64&lang=en-US" -OutFile "C:\firefox.msi"
+          Start-Process msiexec -ArgumentList "/i C:\firefox.msi /qn /norestart DESKTOP_SHORTCUT=true TASKBAR_SHORTCUT=true INSTALL_MAINTENANCE_SERVICE=false PREVENT_REBOOT_REQUIRED=true" -Wait
+
+          # Firefox policies: no first-run pages, no updates, no telemetry, no default-browser nag
+          $dist = "C:\Program Files\Mozilla Firefox\distribution"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          @'
+          {
+            "policies": {
+              "DisableAppUpdate": true,
+              "DisableTelemetry": true,
+              "DisableFirefoxStudies": true,
+              "DontCheckDefaultBrowser": true,
+              "OverrideFirstRunPage": "",
+              "OverridePostUpdatePage": "",
+              "NoDefaultBookmarks": true
+            }
+          }
+          '@ | Set-Content -Path "$dist\policies.json" -Encoding ascii
+
+          # Find Firefox ProgIds (fallback to the standard ones)
+          $urlProg  = 'FirefoxURL-308046B0AF4A39CB'
+          $fileProg = 'FirefoxHTML-308046B0AF4A39CB'
+          try {
+            $ra = Get-ItemProperty 'HKLM:\SOFTWARE\RegisteredApplications'
+            $entry = $ra.PSObject.Properties | Where-Object { $_.Name -like 'Firefox*' } | Select-Object -First 1
+            if ($entry) {
+              $cap = 'HKLM:\' + $entry.Value
+              $u = (Get-ItemProperty "$cap\URLAssociations" -ErrorAction Stop).https
+              $f = (Get-ItemProperty "$cap\FileAssociations" -ErrorAction Stop).'.html'
+              if ($u) { $urlProg = $u }
+              if ($f) { $fileProg = $f }
+            }
+          } catch {
+            Write-Host "Using fallback Firefox ProgIds"
+          }
+          Write-Host "Firefox ProgIds: $urlProg / $fileProg"
+
+          # Default apps file: imported for new profiles AND enforced at every logon through policy
+          $xml = "C:\default-apps.xml"
+          @"
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <DefaultAssociations>
+            <Association Identifier=".htm" ProgId="$fileProg" ApplicationName="Firefox" />
+            <Association Identifier=".html" ProgId="$fileProg" ApplicationName="Firefox" />
+            <Association Identifier="http" ProgId="$urlProg" ApplicationName="Firefox" />
+            <Association Identifier="https" ProgId="$urlProg" ApplicationName="Firefox" />
+          </DefaultAssociations>
+          "@ | Set-Content -Path $xml -Encoding UTF8
+
+          Dism.exe /Online /Import-DefaultAppAssociations:$xml | Out-Null
+          New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Force | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name DefaultAssociationsConfiguration -Value $xml -PropertyType String -Force | Out-Null
+          Write-Host "Firefox installed and set as default browser for new logons"
+
+      - name: 5. Install Xiaomi Unlock Tool 8.2
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $url = "https://github.com/AsInsideOut/miunlocktool/releases/download/Stable8.2/Xiaomi.Unlock.Tool.8.2.zip"
+          New-Item -ItemType Directory -Path "C:\MiUnlock" -Force | Out-Null
+          Invoke-WebRequest $url -OutFile "C:\MiUnlock\tool.zip"
+
+          # Compare this hash with the one on the release page if you want to be sure
+          $hash = (Get-FileHash "C:\MiUnlock\tool.zip" -Algorithm SHA256).Hash
+          Write-Host "tool.zip SHA256: $hash"
+
+          Expand-Archive -Path "C:\MiUnlock\tool.zip" -DestinationPath "C:\MiUnlock\app" -Force
+          $exe = Get-ChildItem "C:\MiUnlock\app" -Recurse -Filter *.exe | Where-Object { $_.Name -match 'Unlock' } | Select-Object -First 1
+          if (-not $exe) { $exe = Get-ChildItem "C:\MiUnlock\app" -Recurse -Filter *.exe | Select-Object -First 1 }
+          if (-not $exe) { throw "No .exe found inside the tool zip" }
+          Write-Host "Tool executable: $($exe.FullName)"
+
+          # Always run the tool with HIGH CPU priority
+          $ifeo = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$($exe.Name)\PerfOptions"
+          New-Item -Path $ifeo -Force | Out-Null
+          New-ItemProperty -Path $ifeo -Name CpuPriorityClass -Value 3 -PropertyType DWord -Force | Out-Null
+
+          # Desktop shortcut for every user
+          $ws = New-Object -ComObject WScript.Shell
+          $lnk = $ws.CreateShortcut("C:\Users\Public\Desktop\Xiaomi Unlock Tool.lnk")
+          $lnk.TargetPath = $exe.FullName
+          $lnk.WorkingDirectory = $exe.DirectoryName
+          $lnk.Save()
+
+      - name: 6. Install and connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+          # accept-dns=false keeps Tailscale from touching DNS (faster, steadier lookups)
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" --accept-dns=false --accept-routes=false
+          Start-Sleep -Seconds 8
+
+      - name: 7. Ready, latency check, keep alive
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          DURATION: ${{ github.event.inputs.duration_minutes }}
+        run: |
+          $ts_ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4 | Select-Object -First 1)
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : NexAdmin   (log in with this one, not runneradmin)" -ForegroundColor Yellow
+          if ($Env:RDP_PASSWORD) {
+            Write-Host "  Password     : your RDP_PASSWORD secret" -ForegroundColor Yellow
+          } else {
+            Write-Host "  Password     : Nexouya2026RdpX7" -ForegroundColor Yellow
+          }
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
+
+          # Latency from this machine to Xiaomi's gateways (for your information)
+          foreach ($h in 'sgp-api.buy.mi.com','api.buy.mi.com') {
+            $ms = 1..5 | ForEach-Object {
+              (Measure-Command { try { Invoke-WebRequest "https://$h" -UseBasicParsing -TimeoutSec 5 | Out-Null } catch { } }).TotalMilliseconds
+            }
+            $stats = $ms | Measure-Object -Average -Minimum
+            Write-Host ("Latency to {0}: avg {1:N0} ms, min {2:N0} ms" -f $h, $stats.Average, $stats.Minimum)
+          }
+
+          $mins = 120
+          if ($Env:DURATION) { $mins = [int]$Env:DURATION }
+          if ($mins -lt 1) { $mins = 120 }
+          if ($mins -gt 350) { $mins = 350 }
+
+          for ($i = 1; $i -le $mins; $i++) {
+            Start-Sleep -Seconds 60
+            $beijing = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(8)).ToString('HH:mm:ss')
+            Write-Host ("[{0}/{1}] Server running - Beijing time {2}" -f $i, $mins, $beijing)
+          }
